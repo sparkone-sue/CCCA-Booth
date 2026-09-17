@@ -119,6 +119,17 @@ aside{border-right:1px solid var(--line);background:var(--panel);display:flex;fl
 #tip b{font-weight:600}
 #toast{position:fixed;left:50%;top:74px;transform:translateX(-50%);background:#1D1B18;color:#F2EFE9;padding:9px 16px;border-radius:7px;font-size:13.5px;z-index:60;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
 #toast.show{opacity:1}
+.sync{display:flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--panel);border-radius:99px;padding:5px 12px 5px 10px;font-size:12.5px;color:var(--muted);white-space:nowrap}
+.sync i{width:8px;height:8px;border-radius:50%;background:#9A948A;flex:none}
+.sync.ok i{background:var(--ok)} .sync.saving i{background:#D2A13A} .sync.bad i{background:var(--warn)}
+dialog{border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);padding:22px 24px;width:min(460px,92vw);box-shadow:0 20px 50px rgba(0,0,0,.3)}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+dialog h2{margin:0 0 6px;font-size:18px;font-weight:500}
+dialog p{margin:0 0 16px;color:var(--muted);font-size:13px}
+dialog label{display:block;font-size:13px;margin:12px 0 5px}
+dialog input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);font:inherit}
+dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
+dialog .err{color:var(--warn);font-size:13px;margin-top:10px;min-height:1em}
 #busy{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:70;color:#fff;font-size:15px}
 #busy.show{display:flex}
 
@@ -142,6 +153,7 @@ aside{border-right:1px solid var(--line);background:var(--panel);display:flex;fl
     <div class="stat"><b id="stSp">0</b><small id="stSpT">/ 57 家已安排</small></div>
     <div class="stat"><b id="stBo">0</b><small>/ 86 展位已用</small></div>
   </div>
+  <button class="sync" id="syncBtn" title="同步设置"><i></i><span id="syncTxt">仅本机</span></button>
   <div class="actions">
     <button class="btn" id="undoBtn" disabled title="Ctrl+Z">撤销</button>
     <button class="btn primary" id="pdfBtn">导出 PDF</button>
@@ -149,6 +161,8 @@ aside{border-right:1px solid var(--line);background:var(--panel);display:flex;fl
     <div class="menu">
       <button class="btn" id="moreBtn" aria-haspopup="true" aria-expanded="false">更多</button>
       <div class="menu-pop" id="morePop">
+        <button id="syncMenuBtn">同步设置</button>
+        <hr>
         <button id="bkBtn">备份进度（JSON）</button>
         <button id="rsBtn">导入备份</button>
         <hr>
@@ -187,6 +201,19 @@ aside{border-right:1px solid var(--line);background:var(--panel);display:flex;fl
 <div id="tip"></div>
 <div id="toast" role="status"></div>
 <div id="busy">正在生成文件…</div>
+<dialog id="syncDlg">
+  <h2>多人同步</h2>
+  <p>连接后，所有人看到和编辑的是同一份安排，数据存在 Google Sheet 里。</p>
+  <div id="urlWrap"><label for="sUrl">Apps Script 网址</label><input id="sUrl" placeholder="https://script.google.com/macros/s/…/exec"></div>
+  <label for="sKey">团队口令</label><input id="sKey" type="password" autocomplete="off">
+  <label for="sWho">你的名字（记录在表格里谁改的）</label><input id="sWho" maxlength="40">
+  <div class="err" id="sErr"></div>
+  <div class="row">
+    <button class="btn danger" id="sOff">改回仅本机</button>
+    <button class="btn" id="sCancel">取消</button>
+    <button class="btn primary" id="sGo">连接</button>
+  </div>
+</dialog>
 <input type="file" id="fileIn" accept=".json,application/json" hidden>
 
 <script>
@@ -201,6 +228,10 @@ const TIER = {
 };
 const SP = Object.fromEntries(SPONSORS.map(s=>[s.id,s]));
 const STORE_KEY = 'ccca-expo-2026-booths-v1';
+// 部署 Apps Script 后，把网址填在下面的引号里，所有打开网页的人就会自动连上同一份数据
+const SYNC_URL = "https://script.google.com/macros/s/AKfycbyC4HWaQgkLw3gMvdiz8JkeKQhxfk1usHchVZXVZUQvoBm76O4NZWvDt2xik3HtI25MXA/exec";
+const SYNC_KEY_STORE = 'ccca-expo-2026-sync-v1';
+const POLL_MS = 6000;
 const AREA = {x:720,y:280,w:1040,h:500};
 
 // ---------- adjacency ----------
@@ -252,14 +283,83 @@ function applyLoaded(obj, strict){
   state={assign,locked};
 }
 function save(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(state)); }catch(e){} }
+function normalize(){ for(const s of Object.keys(state.locked)) if(!state.assign[s]) delete state.locked[s]; }
 function commit(mutator){
-  history.push(JSON.stringify(state)); if(history.length>60) history.shift();
-  mutator(); save(); render();
+  const before=JSON.parse(JSON.stringify(state));
+  history.push(JSON.stringify(before)); if(history.length>60) history.shift();
+  mutator(); normalize(); save(); render();
+  pushChanges(before, state);
 }
 function undo(){
   if(!history.length) return;
+  const before=JSON.parse(JSON.stringify(state));
   state = JSON.parse(history.pop()); pending=null; save(); render(); toast('已撤销');
+  pushChanges(before, state);
 }
+
+// ---------- sync (Google Sheet via Apps Script) ----------
+let sync={url:'',key:'',who:''};
+try{ Object.assign(sync, JSON.parse(localStorage.getItem(SYNC_KEY_STORE)||'{}')); }catch(e){}
+if(SYNC_URL) sync.url=SYNC_URL;
+const online=()=>!!(sync.url && sync.key);
+let inflight=0, editSeq=0, writeQ=Promise.resolve(), lastSync=0, syncState='local';
+function saveSync(){ try{ localStorage.setItem(SYNC_KEY_STORE, JSON.stringify({url:SYNC_URL?'':sync.url,key:sync.key,who:sync.who})); }catch(e){} }
+function rowOf(st,sid){ const b=st.assign[sid]; return {booths:b?[...b].sort(boothSort).join(','):'', locked:!!(b&&st.locked[sid])}; }
+function diffStates(a,b){
+  const out=[];
+  for(const s of SPONSORS){ const x=rowOf(a,s.id), y=rowOf(b,s.id); if(x.booths!==y.booths||x.locked!==y.locked) out.push({id:s.id,name:s.name,tier:s.tier,from:x,to:y}); }
+  return out;
+}
+function setSync(k){
+  syncState=k;
+  const btn=document.getElementById('syncBtn'), tx=document.getElementById('syncTxt');
+  btn.className='sync'+({ok:' ok',saving:' saving',bad:' bad',offline:' bad'}[k]||'');
+  tx.textContent={local:'仅本机',ok:'已同步',saving:'保存中…',bad:'口令不对',offline:'连接不上',loading:'连接中…'}[k]||k;
+}
+async function api(method, payload){
+  let res;
+  if(method==='GET') res=await fetch(sync.url+(sync.url.includes('?')?'&':'?')+'key='+encodeURIComponent(sync.key)+'&t='+Date.now());
+  else res=await fetch(sync.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(payload)});
+  const txt=await res.text();
+  try{ return JSON.parse(txt); }catch(e){ throw new Error('not_json'); }
+}
+function sig(st){ return JSON.stringify(SPONSORS.map(s=>rowOf(st,s.id))); }
+function applyRemote(remote){
+  const cur=state;
+  try{ applyLoaded(remote,false); }catch(e){ return; }
+  if(sig(cur)===sig(state)){ state=cur; return; }
+  if(pending && owners()[pending] && owners()[pending]!==sel) pending=null;
+  save(); render();
+}
+async function pull(){
+  if(!online()) return;
+  const seq=editSeq;
+  try{
+    const r=await api('GET');
+    if(!r.ok){ setSync(r.error==='bad_key'?'bad':'offline'); return; }
+    if(seq!==editSeq || inflight) return;   // a local edit happened meanwhile; next poll will catch up
+    applyRemote(r.state); lastSync=Date.now(); setSync('ok');
+  }catch(e){ setSync('offline'); }
+}
+function pushChanges(before, after){
+  if(!online()) return;
+  const changes=diffStates(before, after);
+  if(!changes.length) return;
+  editSeq++; inflight++; setSync('saving');
+  writeQ=writeQ.then(async()=>{
+    try{
+      const r=await api('POST',{key:sync.key,who:sync.who,changes});
+      if(r.ok){ applyRemote(r.state); setSync(inflight>1?'saving':'ok'); }
+      else if(r.error==='conflict'){ history=[]; applyRemote(r.state); setSync('ok'); toast('别人刚刚改动了相关展位，已刷新为最新安排，请再操作一次'); }
+      else if(r.error==='bad_key'){ setSync('bad'); toast('团队口令不对，这次改动没有保存到云端'); }
+      else { setSync('offline'); toast('云端没有接受这次改动：'+(r.error||'未知错误')); }
+    }catch(e){
+      setSync('offline'); toast('网络出错，这次改动没有同步。稍后会自动恢复为云端的安排，请重试');
+    }finally{ inflight--; editSeq++; }
+  });
+}
+setInterval(()=>{ if(online() && !document.hidden && !inflight) pull(); }, POLL_MS);
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden && online() && !inflight) pull(); });
 
 // ---------- rendering: SVG ----------
 const NS='http://www.w3.org/2000/svg';
@@ -518,7 +618,7 @@ document.getElementById('clearBtn').onclick=()=>{
   closeMenu();
   const n=Object.keys(state.assign).filter(s=>!state.locked[s]).length;
   if(!n){ toast('没有可清空的安排'); return; }
-  if(!confirm(`确定清空 ${n} 家未锁定赞助商的展位？锁定的会保留。可以用“撤销”恢复。`)) return;
+  if(!confirm(`确定清空 ${n} 家未锁定赞助商的展位？锁定的会保留。可以用“撤销”恢复。${online()?'\n\n注意：已开启同步，所有人都会看到清空后的结果。':''}`)) return;
   commit(()=>{ for(const s of Object.keys(state.assign)) if(!state.locked[s]) delete state.assign[s]; sel=null; pending=null; });
   toast(`已清空 ${n} 家`);
 };
@@ -534,9 +634,11 @@ fileIn.onchange=async()=>{
   const f=fileIn.files[0]; if(!f) return;
   try{
     const obj=JSON.parse(await f.text());
-    const before=JSON.stringify(state);
+    if(online() && !confirm('导入会替换所有人看到的安排，确定继续？')) return;
+    const beforeObj=JSON.parse(JSON.stringify(state));
     applyLoaded(obj,true);
-    history.push(before); sel=null; pending=null; save(); render();
+    history.push(JSON.stringify(beforeObj)); sel=null; pending=null; save(); render();
+    pushChanges(beforeObj, state);
     toast(`已导入 ${Object.keys(state.assign).length} 家的安排`);
   }catch(e){ toast('这个文件不是有效的展位备份'); }
 };
@@ -705,10 +807,54 @@ async function exportXLSX(){
 document.getElementById('pdfBtn').onclick=exportPDF;
 document.getElementById('xlsBtn').onclick=exportXLSX;
 
+// ---------- sync dialog ----------
+const dlg=document.getElementById('syncDlg');
+function openSync(){
+  closeMenu();
+  document.getElementById('urlWrap').style.display=SYNC_URL?'none':'';
+  document.getElementById('sUrl').value=sync.url||'';
+  document.getElementById('sKey').value=sync.key||'';
+  document.getElementById('sWho').value=sync.who||'';
+  document.getElementById('sErr').textContent='';
+  document.getElementById('sOff').style.display=online()?'':'none';
+  if(dlg.showModal) dlg.showModal(); else dlg.setAttribute('open','');
+}
+document.getElementById('syncBtn').onclick=openSync;
+document.getElementById('syncMenuBtn').onclick=openSync;
+document.getElementById('sCancel').onclick=()=>dlg.close();
+document.getElementById('sOff').onclick=()=>{ sync.key=''; if(!SYNC_URL) sync.url=''; saveSync(); setSync('local'); dlg.close(); toast('已改回仅本机模式，之后的改动只存在这台电脑'); };
+document.getElementById('sGo').onclick=async()=>{
+  const err=document.getElementById('sErr');
+  const url=SYNC_URL||document.getElementById('sUrl').value.trim();
+  const key=document.getElementById('sKey').value.trim();
+  const who=document.getElementById('sWho').value.trim();
+  if(!/^https:\/\/script\.google(usercontent)?\.com\//.test(url)){ err.textContent='请填 Apps Script 部署后给的网址，以 https://script.google.com/ 开头'; return; }
+  if(!key){ err.textContent='请填团队口令'; return; }
+  if(!who){ err.textContent='请填你的名字'; return; }
+  err.textContent='正在连接…';
+  const prev={...sync};
+  sync={url,key,who};
+  try{
+    const r=await api('GET');
+    if(!r.ok){ sync=prev; err.textContent= r.error==='bad_key'?'口令不对，或者还没在脚本里设置口令':'连接失败：'+r.error; return; }
+    saveSync(); dlg.close();
+    const remoteCount=Object.keys((r.state&&r.state.assign)||{}).length;
+    const localCount=Object.keys(state.assign).length;
+    if(!remoteCount && localCount && confirm(`云端还没有安排。要把这台电脑上已排好的 ${localCount} 家上传到云端吗？`)){
+      pushChanges({assign:{},locked:{}}, state);
+    } else {
+      history=[]; applyLoaded(r.state,false); save(); render(); setSync('ok');
+      if(remoteCount) toast(`已连接，载入云端的 ${remoteCount} 家安排`); else toast('已连接');
+    }
+  }catch(e){ sync=prev; err.textContent='连接不上。请确认网址正确，并且部署时“谁可以访问”选的是“任何人”'; }
+};
+
 // ---------- init ----------
 load();
 fitArea();
 render();
+if(online()){ setSync('loading'); pull(); }
+else if(SYNC_URL){ setTimeout(openSync,300); }
 </script>
 </body>
 </html>
